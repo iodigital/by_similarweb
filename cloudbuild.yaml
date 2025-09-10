@@ -1,0 +1,72 @@
+# Build → Deploy to Cloud Run with env + secret
+# Save as: cloudbuild.yaml (in your repo root)
+
+substitutions:
+  # ----- EDIT THESE (or set in the Cloud Build trigger UI) -----
+  _SERVICE_NAME: "similarweb-to-bq"
+  _REGION: "europe-west2"          # London
+  _PROJECT_ID: "your-gcp-project"
+  _BQ_DATASET: "marketing"
+  _BQ_TABLE: "similarweb_traffic"
+  _DOMAINS: "example.com,another.com"
+  _START_DATE: "2024-01"
+  # Secret in Secret Manager must already exist with this name:
+  _SW_SECRET_NAME: "similarweb-api-key"
+  # Optional: Artifact Registry repo name (created once)
+  _AR_REPO: "cloud-run"
+  # -------------------------------------------------------------
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # 1) Build and push the image to Artifact Registry
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: "Create AR repo if missing (no-op if exists)"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud artifacts repositories describe "$_AR_REPO" \
+          --location="$_REGION" --project="$_PROJECT_ID" >/dev/null 2>&1 \
+        || gcloud artifacts repositories create "$_AR_REPO" \
+             --repository-format=docker \
+             --location="$_REGION" \
+             --description="Images for Cloud Run" \
+             --project="$_PROJECT_ID"
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Docker build"
+    args:
+      [
+        "build",
+        "-t",
+        "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA",
+        "."
+      ]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Docker push"
+    args:
+      ["push", "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA"]
+
+  # 2) Deploy to Cloud Run
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: "Deploy to Cloud Run"
+    args:
+      [
+        "run","deploy","${_SERVICE_NAME}",
+        "--image","${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA",
+        "--region","${_REGION}",
+        "--project","${_PROJECT_ID}",
+        "--platform","managed",
+        "--no-allow-unauthenticated",            # keep private
+        "--set-env-vars","PROJECT_ID=${_PROJECT_ID},BQ_DATASET=${_BQ_DATASET},BQ_TABLE=${_BQ_TABLE},DOMAINS=${_DOMAINS},START_DATE=${_START_DATE}",
+        "--set-secrets","SIMILARWEB_API_KEY=${_SW_SECRET_NAME}:latest"
+      ]
+
+images:
+  - "${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA"
+
+# (Optional) Grant the service’s default identity permission to read the secret:
+# Do this once in IAM if you see permission errors. See notes below.
